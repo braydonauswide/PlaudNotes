@@ -7,6 +7,8 @@ at api.plaud.ai used by web.plaud.ai.
 
 from __future__ import annotations
 
+import gzip
+import json as _json
 import logging
 import os
 import re
@@ -367,10 +369,87 @@ class PlaudClient:
         return [Recording.from_api(f) for f in files]
 
     def get_recording_detail(self, file_id: str) -> dict[str, Any]:
-        """Get full detail for a recording including transcript and AI content."""
+        """Get full detail for a recording including transcript and AI content.
+
+        The Plaud `/file/detail/{id}` response (as of 2026-05) returns:
+          - `file_name` (not `filename`)
+          - `content_list[]` with `data_link` S3 pre-signed URLs to gzipped
+            JSON for transcripts (`transaction`, `transaction_polish`) and
+            summaries (`auto_sum_note`, `sum_multi_note`).
+          - `pre_download_content_list[]` with inline `data_content` (JSON
+            string) for the auto summary, so callers can avoid an extra
+            S3 fetch for that one item.
+        Older code paths expected `filename`, `trans_result`, `ai_content`
+        at the top level — those keys no longer exist. We normalise the
+        response so downstream code keeps working: we synthesise a
+        `filename` alias and an `ai_content` field by parsing the
+        pre_download payload.
+        """
         file_id = self._validate_file_id(file_id)
         data = self._get(f"/file/detail/{file_id}")
-        return data.get("data", data)
+        detail = data.get("data", data)
+        if isinstance(detail, dict):
+            # Normalise filename
+            if "filename" not in detail and "file_name" in detail:
+                detail["filename"] = detail["file_name"]
+            # Lift inline summary out of pre_download_content_list
+            if "ai_content" not in detail:
+                pre_list = detail.get("pre_download_content_list") or []
+                for item in pre_list:
+                    dc = item.get("data_content") if isinstance(item, dict) else None
+                    if not isinstance(dc, str):
+                        continue
+                    try:
+                        parsed = _json.loads(dc)
+                    except (ValueError, TypeError):
+                        continue
+                    if isinstance(parsed, dict) and parsed.get("ai_content"):
+                        detail["ai_content"] = parsed["ai_content"]
+                        break
+        return detail
+
+    def _fetch_s3_json(self, url: str) -> Any | None:
+        """Fetch a Plaud S3 pre-signed URL, gunzip if needed, parse JSON.
+
+        Returns the parsed JSON, or None on failure. Does not raise so
+        callers can fall back gracefully.
+        """
+        try:
+            # Use a fresh client with NO Authorization header — the
+            # pre-signed URL carries its own auth in the query string,
+            # and S3 rejects unexpected headers.
+            with httpx.Client(timeout=DEFAULT_TIMEOUT) as c:
+                resp = c.get(url)
+                resp.raise_for_status()
+                body = resp.content
+            if url.endswith(".gz") or body[:2] == b"\x1f\x8b":
+                body = gzip.decompress(body)
+            return _json.loads(body)
+        except (httpx.HTTPError, OSError, ValueError) as e:
+            logger.warning("S3 fetch failed: %s", type(e).__name__)
+            return None
+
+    def _find_content_link(
+        self, detail: dict[str, Any], data_types: tuple[str, ...]
+    ) -> str | None:
+        """Find the first ready S3 link in detail.content_list matching one
+        of the given data_types, in priority order."""
+        content_list = detail.get("content_list") or []
+        # Build a lookup by data_type so we can honor priority order.
+        by_type: dict[str, str] = {}
+        for item in content_list:
+            if not isinstance(item, dict):
+                continue
+            dt = item.get("data_type")
+            link = item.get("data_link")
+            status = item.get("task_status")
+            # status==1 means ready; skip in-progress / failed items.
+            if dt and link and status == 1 and dt not in by_type:
+                by_type[dt] = link
+        for dt in data_types:
+            if dt in by_type:
+                return by_type[dt]
+        return None
 
     def get_audio_url(self, file_id: str) -> str:
         """Get a temporary download URL for the recording audio."""
@@ -382,30 +461,100 @@ class PlaudClient:
     # ── Transcripts ─────────────────────────────────────────────
 
     def get_transcript(self, file_id: str) -> Transcript:
-        """Get the transcript for a recording."""
+        """Get the transcript for a recording.
+
+        As of 2026-05 the transcript text lives in a gzipped JSON file on
+        S3, referenced by `content_list[].data_link` with `data_type` of
+        `transaction_polish` (speaker-cleaned, preferred) or
+        `transaction` (raw fallback). Each segment is shaped:
+            {start_time, end_time, content, speaker, original_speaker}
+        Older code paths expected `trans_result.segments` inline in the
+        detail response — that no longer exists.
+        """
         file_id = self._validate_file_id(file_id)
         detail = self.get_recording_detail(file_id)
-        trans_result = detail.get("trans_result", {})
 
-        segments = []
+        segments: list[TranscriptSegment] = []
+
+        # Legacy path (kept for backwards compat if Plaud reverts shape):
+        trans_result = detail.get("trans_result", {})
         if isinstance(trans_result, dict):
             raw_segments = trans_result.get("segments", trans_result.get("result", []))
             segments = [TranscriptSegment.from_api(s) for s in raw_segments]
         elif isinstance(trans_result, list):
             segments = [TranscriptSegment.from_api(s) for s in trans_result]
 
+        # New path: fetch from S3.
+        if not segments:
+            link = self._find_content_link(
+                detail, ("transaction_polish", "transaction")
+            )
+            if link:
+                payload = self._fetch_s3_json(link)
+                raw_segments = []
+                if isinstance(payload, list):
+                    raw_segments = payload
+                elif isinstance(payload, dict):
+                    raw_segments = (
+                        payload.get("segments")
+                        or payload.get("result")
+                        or []
+                    )
+                # Each segment uses {start_time, end_time, content, speaker}.
+                # TranscriptSegment.from_api looks for "text"/"start_time_ms"
+                # — adapt the keys here.
+                adapted = []
+                for s in raw_segments:
+                    if not isinstance(s, dict):
+                        continue
+                    adapted.append({
+                        "text": s.get("content", s.get("text", "")),
+                        "speaker": s.get("speaker", s.get("spk", "")),
+                        "start_time_ms": s.get(
+                            "start_time", s.get("start_time_ms", 0)
+                        ),
+                        "end_time_ms": s.get(
+                            "end_time", s.get("end_time_ms", 0)
+                        ),
+                    })
+                segments = [TranscriptSegment.from_api(s) for s in adapted]
+
         return Transcript(file_id=file_id, segments=segments)
 
     # ── AI Summaries ────────────────────────────────────────────
 
     def get_summary(self, file_id: str) -> str:
-        """Get the AI-generated summary for a recording."""
+        """Get the AI-generated summary for a recording.
+
+        get_recording_detail lifts the inline pre-downloaded summary into
+        `ai_content` automatically. If that's empty (e.g. summary too
+        large for inline payload), fall back to fetching the
+        `auto_sum_note` / `sum_multi_note` S3 link.
+        """
         file_id = self._validate_file_id(file_id)
         detail = self.get_recording_detail(file_id)
         ai_content = detail.get("ai_content", "")
         if isinstance(ai_content, dict):
-            return ai_content.get("content", ai_content.get("summary", str(ai_content)))
-        return str(ai_content) if ai_content else ""
+            return ai_content.get(
+                "content", ai_content.get("summary", str(ai_content))
+            )
+        if ai_content:
+            return str(ai_content)
+
+        # Fallback: fetch from S3.
+        link = self._find_content_link(
+            detail, ("auto_sum_note", "sum_multi_note")
+        )
+        if link:
+            payload = self._fetch_s3_json(link)
+            if isinstance(payload, dict):
+                return str(
+                    payload.get("ai_content")
+                    or payload.get("content")
+                    or payload.get("summary")
+                    or ""
+                )
+        return ""
 
     def get_notes(self, file_id: str) -> str:
         """Get AI-generated notes for a recording."""
@@ -477,27 +626,14 @@ class PlaudClient:
                 "created": rec.created_at.isoformat() if rec.created_at else "unknown",
             }
             try:
-                detail = self.get_recording_detail(rec.file_id)
-
-                # Extract transcript
-                trans_result = detail.get("trans_result", {})
-                if isinstance(trans_result, dict):
-                    segments = trans_result.get("segments", [])
-                    if segments:
-                        transcript = Transcript(
-                            file_id=rec.file_id,
-                            segments=[TranscriptSegment.from_api(s) for s in segments],
-                        )
-                        entry["transcript"] = transcript.full_text
-
-                # Extract summary
-                ai_content = detail.get("ai_content", "")
-                if isinstance(ai_content, dict):
-                    entry["summary"] = ai_content.get(
-                        "content", ai_content.get("summary", "")
-                    )
-                elif ai_content:
-                    entry["summary"] = str(ai_content)
+                # Use get_transcript / get_summary which know about the
+                # 2026-05 API shape (S3 links + pre_download_content_list).
+                transcript = self.get_transcript(rec.file_id)
+                if transcript.segments:
+                    entry["transcript"] = transcript.full_text
+                summary = self.get_summary(rec.file_id)
+                if summary:
+                    entry["summary"] = summary
             except PlaudAPIError:
                 entry["error"] = "Could not fetch details"
 
@@ -534,20 +670,11 @@ class PlaudClient:
                 })
                 continue
 
-            # Check transcript and summary
+            # Check transcript and summary using new-shape fetchers.
             try:
-                detail = self.get_recording_detail(rec.file_id)
-
-                # Search transcript
-                trans_result = detail.get("trans_result", {})
-                trans_text = ""
-                if isinstance(trans_result, dict):
-                    segments = trans_result.get("segments", [])
-                    trans_text = " ".join(
-                        s.get("text", "") for s in segments
-                    )
+                transcript = self.get_transcript(rec.file_id)
+                trans_text = transcript.text_only
                 if query_lower in trans_text.lower():
-                    # Extract snippet around match
                     idx = trans_text.lower().index(query_lower)
                     start = max(0, idx - 100)
                     end = min(len(trans_text), idx + len(query) + 100)
@@ -559,14 +686,7 @@ class PlaudClient:
                     })
                     continue
 
-                # Search summary
-                ai_content = detail.get("ai_content", "")
-                summary_text = ""
-                if isinstance(ai_content, dict):
-                    summary_text = ai_content.get("content", str(ai_content))
-                elif isinstance(ai_content, str):
-                    summary_text = ai_content
-
+                summary_text = self.get_summary(rec.file_id)
                 if query_lower in summary_text.lower():
                     idx = summary_text.lower().index(query_lower)
                     start = max(0, idx - 100)
