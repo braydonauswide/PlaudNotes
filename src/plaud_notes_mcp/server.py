@@ -242,25 +242,33 @@ def get_recording_detail(file_id: str) -> str:
         client = _get_client()
         detail = client.get_recording_detail(file_id)
 
-        # Build a clean summary of the detail
+        # Build a clean summary of the detail. The Plaud detail endpoint
+        # uses `file_name` (snake-case); get_recording_detail normalises
+        # this to also expose `filename`.
         result: dict = {
             "file_id": file_id,
-            "filename": detail.get("filename", "Unknown"),
+            "filename": detail.get("filename", detail.get("file_name", "Unknown")),
             "duration_ms": detail.get("duration", 0),
         }
 
-        # Extract transcript text
-        trans_result = detail.get("trans_result", {})
-        if isinstance(trans_result, dict):
-            segments = trans_result.get("segments", [])
-            if segments:
-                result["transcript_segments"] = len(segments)
-                result["transcript_preview"] = " ".join(
-                    s.get("text", "") for s in segments[:10]
+        # Transcript preview — use get_transcript so we share the
+        # S3-fetch + new-shape logic in one place.
+        try:
+            transcript = client.get_transcript(file_id)
+            if transcript.segments:
+                result["transcript_segments"] = len(transcript.segments)
+                preview_text = " ".join(
+                    s.text for s in transcript.segments[:10] if s.text
                 )
+                result["transcript_preview"] = preview_text
+        except PlaudAPIError:
+            pass
 
-        # Extract AI summary
+        # AI summary — get_recording_detail already lifts ai_content from
+        # pre_download_content_list. Fall back to S3 via get_summary.
         ai_content = detail.get("ai_content", "")
+        if not ai_content:
+            ai_content = client.get_summary(file_id)
         if ai_content:
             if isinstance(ai_content, dict):
                 result["ai_summary"] = ai_content.get(
