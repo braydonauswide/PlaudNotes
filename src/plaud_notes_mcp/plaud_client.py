@@ -304,6 +304,18 @@ class PlaudClient:
                             correct_domain,
                         )
 
+                # Handle other Plaud API error envelopes: HTTP 200 with
+                # non-zero `status` means application-level failure.
+                # -3105 == "not found", -3900 == rate limited, etc.
+                if isinstance(data, dict):
+                    status = data.get("status")
+                    if isinstance(status, int) and status not in (0, 200, -302):
+                        msg = data.get("msg") or data.get("message") or "no message"
+                        raise PlaudAPIError(
+                            f"Plaud API status {status}: {msg}",
+                            status_code=status,
+                        )
+
                 return data
             except PlaudAuthError:
                 raise
@@ -386,8 +398,27 @@ class PlaudClient:
         pre_download payload.
         """
         file_id = self._validate_file_id(file_id)
-        data = self._get(f"/file/detail/{file_id}")
+        try:
+            data = self._get(f"/file/detail/{file_id}")
+        except PlaudAPIError as e:
+            # Plaud returns status -3105 for "not found"; surface a
+            # clearer error so callers don't have to parse the message.
+            if e.status_code == -3105:
+                raise PlaudAPIError(
+                    f"Recording not found: {file_id}. "
+                    f"Use list_recordings to find valid file_ids.",
+                    status_code=404,
+                ) from None
+            raise
         detail = data.get("data", data)
+        # Defensive: even after Fix #2 there may be edge cases where
+        # `data` slips through as None (e.g. partial server response).
+        if detail is None:
+            raise PlaudAPIError(
+                f"Recording not found: {file_id}. "
+                f"Use list_recordings to find valid file_ids.",
+                status_code=404,
+            )
         if isinstance(detail, dict):
             # Normalise filename
             if "filename" not in detail and "file_name" in detail:
@@ -427,6 +458,26 @@ class PlaudClient:
             return _json.loads(body)
         except (httpx.HTTPError, OSError, ValueError) as e:
             logger.warning("S3 fetch failed: %s", type(e).__name__)
+            return None
+
+    def _fetch_s3_text(self, url: str) -> str | None:
+        """Fetch a Plaud S3 pre-signed URL, gunzip if needed, return decoded text.
+
+        Plaud stores summaries (`auto_sum_note`, `sum_multi_note`,
+        `mind_map`) as `ai_content.md.gz` — gzipped markdown, NOT JSON.
+        Use this helper for those data_types; use `_fetch_s3_json` for
+        transcripts which ARE JSON.
+        """
+        try:
+            with httpx.Client(timeout=DEFAULT_TIMEOUT) as c:
+                resp = c.get(url)
+                resp.raise_for_status()
+                body = resp.content
+            if url.endswith(".gz") or body[:2] == b"\x1f\x8b":
+                body = gzip.decompress(body)
+            return body.decode("utf-8", errors="replace")
+        except (httpx.HTTPError, OSError) as e:
+            logger.warning("S3 text fetch failed: %s", type(e).__name__)
             return None
 
     def _find_content_link(
@@ -541,19 +592,16 @@ class PlaudClient:
         if ai_content:
             return str(ai_content)
 
-        # Fallback: fetch from S3.
+        # Fallback: fetch from S3. Summaries are stored as gzipped
+        # markdown (.md.gz), NOT JSON — `_fetch_s3_json` would silently
+        # return None on a JSONDecodeError. Use the text helper instead.
         link = self._find_content_link(
             detail, ("auto_sum_note", "sum_multi_note")
         )
         if link:
-            payload = self._fetch_s3_json(link)
-            if isinstance(payload, dict):
-                return str(
-                    payload.get("ai_content")
-                    or payload.get("content")
-                    or payload.get("summary")
-                    or ""
-                )
+            text = self._fetch_s3_text(link)
+            if text:
+                return text
         return ""
 
     def get_notes(self, file_id: str) -> str:
@@ -584,9 +632,32 @@ class PlaudClient:
     # ── Speakers ────────────────────────────────────────────────
 
     def list_speakers(self) -> list[dict[str, Any]]:
-        """List all known speakers."""
+        """List all known speakers.
+
+        Projects the response to a lean shape — drops the per-speaker
+        192-dim embedding vectors and raw sample arrays from the Plaud
+        API. The full payload is ~250KB / 62K tokens; the projection
+        keeps things under ~5KB while preserving the agent-useful keys.
+        """
         data = self._get("/speaker/list")
-        return data.get("data_speaker_list", data.get("data", []))
+        raw = data.get("data_speaker_list", data.get("data", []))
+        if isinstance(raw, dict):
+            raw = raw.get("speakers", [])
+        out = []
+        for s in raw:
+            if not isinstance(s, dict):
+                continue
+            sample_counts = s.get("sample_counts") or {}
+            out.append({
+                "speaker_id": s.get("speaker_id", s.get("id", "")),
+                "speaker_name": s.get("speaker_name", s.get("name", "")),
+                "speaker_type": s.get("speaker_type"),
+                "sample_count": sum(
+                    v for v in sample_counts.values() if isinstance(v, int)
+                ),
+                "has_voice_match": bool(s.get("embeddings")),
+            })
+        return out
 
     # ── User & Devices ─────────────────────────────────────────
 
