@@ -11,9 +11,12 @@ import hmac
 import json
 import logging
 import os
+from datetime import datetime, timezone
+from typing import Annotated
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -23,6 +26,22 @@ from plaud_notes_mcp.plaud_client import (
     PlaudAuthError,
     PlaudClient,
 )
+
+
+# Annotated file_id type — surfaces description into the JSON schema
+# so MCP clients can render it. Several agents have guessed `id`,
+# `recording_id`, `transcript_id`, or passed the URL — this nudges
+# them toward the canonical opaque value.
+FileIdField = Annotated[
+    str,
+    Field(
+        description=(
+            "The Plaud file_id from list_recordings (24-64 character hex). "
+            "NOT the recording title, the URL, or any other display name. "
+            "Always call list_recordings first if you don't have this."
+        ),
+    ),
+]
 
 load_dotenv()
 
@@ -167,14 +186,15 @@ def list_recordings(
 
 
 @mcp.tool()
-def get_transcript(file_id: str) -> str:
+def get_transcript(file_id: FileIdField) -> str:
     """Get the full transcript of a Plaud Notes recording.
 
     Returns the complete transcription text with speaker labels.
     Use list_recordings first to find the file_id.
 
     Args:
-        file_id: The recording's file ID (32-character hex string).
+        file_id: The Plaud file_id from list_recordings (24-64 char hex).
+            Not the recording title or URL.
     """
     try:
         client = _get_client()
@@ -198,14 +218,14 @@ def get_transcript(file_id: str) -> str:
 
 
 @mcp.tool()
-def get_summary(file_id: str) -> str:
+def get_summary(file_id: FileIdField) -> str:
     """Get the AI-generated summary of a Plaud Notes recording.
 
-    Returns the summary/notes that Plaud AI generated from the recording.
-    Use list_recordings first to find the file_id.
+    Returns the markdown summary that Plaud AI generated from the
+    recording. Use list_recordings first to find the file_id.
 
     Args:
-        file_id: The recording's file ID (32-character hex string).
+        file_id: The Plaud file_id from list_recordings (24-64 char hex).
     """
     try:
         client = _get_client()
@@ -214,13 +234,10 @@ def get_summary(file_id: str) -> str:
         if not summary:
             return f"No AI summary available for recording {file_id}."
 
-        # Also try to get AI notes
-        notes = client.get_notes(file_id)
-
+        # Note: dropped the legacy `client.get_notes(file_id)` call —
+        # Plaud's `/ai/query_note` endpoint 422s on every request now,
+        # and the summary already covers the same content.
         result = {"file_id": file_id, "summary": summary}
-        if notes:
-            result["notes"] = notes
-
         return json.dumps(result, indent=2)
     except PlaudAuthError as e:
         return f"Authentication error: {e}"
@@ -229,14 +246,14 @@ def get_summary(file_id: str) -> str:
 
 
 @mcp.tool()
-def get_recording_detail(file_id: str) -> str:
+def get_recording_detail(file_id: FileIdField) -> str:
     """Get complete details for a Plaud Notes recording.
 
     Returns all metadata, transcript, and AI content for a single recording.
     This is the most comprehensive view of a recording.
 
     Args:
-        file_id: The recording's file ID (32-character hex string).
+        file_id: The Plaud file_id from list_recordings (24-64 char hex).
     """
     try:
         client = _get_client()
@@ -377,14 +394,14 @@ def list_speakers() -> str:
 
 
 @mcp.tool()
-def get_audio_url(file_id: str) -> str:
+def get_audio_url(file_id: FileIdField) -> str:
     """Get a temporary download URL for a recording's audio file.
 
     Returns a pre-signed URL that can be used to download the MP3 audio.
     The URL is temporary and will expire.
 
     Args:
-        file_id: The recording's file ID (32-character hex string).
+        file_id: The Plaud file_id from list_recordings (24-64 char hex).
     """
     try:
         client = _get_client()
@@ -417,7 +434,30 @@ def get_user_info() -> str:
     try:
         client = _get_client()
         info = client.get_user_info()
-        return json.dumps({"user": info}, indent=2)
+        # Plaud returns a deeply-nested envelope:
+        #   {user: {data_user: {nickname, email, country, expire_time, ...}}}
+        # Project to the agent-useful keys; convert epoch -> ISO.
+        u = info.get("data_user", info) if isinstance(info, dict) else {}
+        if not isinstance(u, dict):
+            u = {}
+        expire = u.get("expire_time", 0) or 0
+        try:
+            expire_iso = (
+                datetime.fromtimestamp(expire, tz=timezone.utc).isoformat()
+                if expire else None
+            )
+        except (ValueError, OSError, OverflowError):
+            expire_iso = None
+        result = {
+            "user_id": u.get("id", ""),
+            "nickname": u.get("nickname", ""),
+            "email": u.get("email", ""),
+            "country": u.get("country", ""),
+            "membership_id": u.get("membership_id"),
+            "membership_expires": expire_iso,
+            "seconds_remaining": u.get("seconds_left"),
+        }
+        return json.dumps({"user": result}, indent=2)
     except PlaudAuthError as e:
         return f"Authentication error: {e}"
     except PlaudAPIError as e:
@@ -473,17 +513,43 @@ def get_recent_context(count: int = 5) -> str:
 
 
 @mcp.tool()
-def get_recordings_by_tag(tag_id: str) -> str:
+def get_recordings_by_tag(
+    tag_id: str = "",
+    tag_name: str = "",
+) -> str:
     """Get all recordings with a specific tag/folder.
 
-    Use list_tags first to find available tag IDs, then use this tool
-    to see all recordings within that tag.
+    Pass either `tag_id` (the opaque hex from list_tags) OR `tag_name`
+    (the human-readable folder name like "Bargain Steel"). At least one
+    is required. If you have only the tag name, pass it as `tag_name`
+    instead of `tag_id` — the tool resolves it server-side.
 
     Args:
-        tag_id: The tag ID to filter by.
+        tag_id: The opaque tag hex from list_tags (preferred if known).
+        tag_name: Human-readable tag name; resolved against list_tags.
+            Case-insensitive exact match.
     """
     try:
         client = _get_client()
+        if not tag_id and not tag_name:
+            return (
+                "Either tag_id or tag_name is required. "
+                "Call list_tags to see available tags."
+            )
+        if not tag_id and tag_name:
+            tags = client.list_tags()
+            tn_lower = tag_name.lower()
+            match = next(
+                (t for t in tags if t.name.lower() == tn_lower), None
+            )
+            if not match:
+                available = ", ".join(t.name for t in tags[:20])
+                suffix = " ..." if len(tags) > 20 else ""
+                return (
+                    f"No tag named {tag_name!r}. "
+                    f"Available tags include: {available}{suffix}"
+                )
+            tag_id = match.tag_id
         recordings = client.get_recordings_by_tag(tag_id)
 
         if not recordings:
